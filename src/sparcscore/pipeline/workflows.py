@@ -3,6 +3,7 @@ from sparcscore.pipeline.segmentation import (
     ShardedSegmentation,
     TimecourseSegmentation,
     MultithreadedSegmentation,
+    CellposeBatchSegmentation,
 )
 from sparcscore.processing.preprocessing import percentile_normalization, downsample_img
 from sparcscore.processing.utils import plot_image, visualize_class
@@ -401,14 +402,14 @@ class BaseSegmentation(Segmentation):
         visualize_class(
             classes_wga_filtered, self.maps["watershed"], self.maps["normalized"][0]
         )
-    
+
     def _read_cellpose_model(self, modeltype, name, use_GPU):
         if modeltype == "pretrained":
             model = models.Cellpose(model_type=name, gpu=use_GPU)
         elif modeltype == "custom":
             model = models.CellposeModel(pretrained_model = name, gpu=use_GPU)
         return model
-    
+
     def return_empty_mask(self, input_image):
         n_channels, x, y = input_image.shape
         self.save_segmentation(input_image, np.zeros((2, x, y)), [])
@@ -440,7 +441,7 @@ class WGASegmentation(BaseSegmentation):
         return channels, segmentation
 
     def process(self, input_image):
-        
+
         self.maps = {
             "normalized": None,
             "median": None,
@@ -636,7 +637,7 @@ class DAPISegmentationCellpose(BaseSegmentation):
         #manually delete model and perform gc to free up memory on GPU
         del model
         gc.collect()
-        torch.cuda.empty_cache()  
+        torch.cuda.empty_cache()
 
     def process(self, input_image):
         # initialize location to save masks to
@@ -666,6 +667,11 @@ class ShardedDAPISegmentationCellpose(ShardedSegmentation):
 class CytosolSegmentationCellpose(BaseSegmentation):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # check if GPU is available
+        if torch.cuda.is_available():
+            self.use_GPU = True
+        else:
+            self.use_GPU = False
 
     def _finalize_segmentation_results(self):
         # The required maps are only nucleus channel
@@ -681,88 +687,73 @@ class CytosolSegmentationCellpose(BaseSegmentation):
         segmentation = np.stack(
             [self.maps["nucleus_segmentation"], self.maps["cytosol_segmentation"]]
         ).astype(np.uint32)
-        
+
         return channels, segmentation
 
     def cellpose_segmentation(self, input_image):
-        # clean up old cached variables to free up GPU memory
-        gc.collect()
-        torch.cuda.empty_cache()  
+        self._clear_cuda_cache()
 
         # check that image is int
         input_image = input_image.astype(np.uint16)
 
-        # check if GPU is available
-        if torch.cuda.is_available():
-            use_GPU = True
-        else:
-            use_GPU = False
-
         # currently no real acceleration through using GPU as we can't load batches
-        self.log(f"GPU Status for segmentation: {use_GPU}")
+        self.log(f"GPU Status for segmentation: {self.use_GPU}")
 
-        # load correct segmentation model for nuclei
-        if "model" in self.config["nucleus_segmentation"].keys():
-            model_name = self.config["nucleus_segmentation"]["model"]
-            model = self._read_cellpose_model("pretrained", model_name, use_GPU)
-        elif "model_path" in self.config["nucleus_segmentation"].keys():
-            model_name = self.config["nucleus_segmentation"]["model_path"]
-            model = self._read_cellpose_model("custom", model_name, use_GPU)
+        nucleus_diameter, nucleus_model = self.load_nucleus_model()
 
-        if "diameter" in self.config["nucleus_segmentation"].keys():
-            diameter = self.config["nucleus_segmentation"]["diameter"]
-        else:
-            diameter = None
-
-        self.log(f"Segmenting nuclei using the following model: {model_name}")
-
-        masks_nucleus = model.eval(
-            [input_image], diameter=diameter, channels=[1, 0]
+        masks_nucleus = nucleus_model.eval(
+            [input_image], diameter=nucleus_diameter, channels=[1, 0]
         )[0]
-        
+
         masks_nucleus = np.array(masks_nucleus)  # convert to array
 
-        #manually delete model and perform gc to free up memory on GPU
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()  
+        #manually delete nucleus model and perform gc to free up memory on GPU
+        del nucleus_model
+        self._clear_cuda_cache()
 
-        # load correct segmentation model for cytosol
-        if "model" in self.config["cytosol_segmentation"].keys():
-            model_name = self.config["cytosol_segmentation"]["model"]
-            model = self._read_cellpose_model("pretrained", model_name, use_GPU)
-        elif "model_path" in self.config["cytosol_segmentation"].keys():
-            model_name = self.config["cytosol_segmentation"]["model_path"]
-            model = self._read_cellpose_model("custom", model_name, use_GPU)
-
-        if "diameter" in self.config["cytosol_segmentation"].keys():
-            diameter = self.config["cytosol_segmentation"]["diameter"]
-        else:
-            diameter = None
-
-        self.log(f"Segmenting cytosol using the following model: {model_name}")
-        masks_cytosol = model.eval(
-            [input_image], diameter=diameter, channels=[2, 1]
+        cytosol_diameter, cytosol_model = self.load_cytosol_model()
+        masks_cytosol = cytosol_model.eval(
+            [input_image], diameter=cytosol_diameter, channels=[2, 1]
         )[0]
 
         masks_cytosol = np.array(masks_cytosol)  # convert to array
 
-        #manually delete model and perform gc to free up memory on GPU
-        del model
-        gc.collect()
-        torch.cuda.empty_cache() 
+        #manually delete cytosol model and perform gc to free up memory on GPU
+        del cytosol_model
+        self._clear_cuda_cache()
 
         if self.debug:
             # save unfiltered masks for visualization of filtering process
             masks_nucleus_unfiltered = masks_nucleus.copy()
             masks_cytosol_unfiltered = masks_cytosol.copy()
 
-        #log start time of cell filtering to track
-        start = time.time()
+        masks_nucleus, masks_cytosol = self.filter_cell_masks(masks_nucleus, masks_cytosol)
 
+        if self.debug:
+            self.plot_nucleus_cytosol_masks(
+                masks_cytosol,
+                masks_cytosol_unfiltered,
+                masks_nucleus,
+                masks_nucleus_unfiltered
+            )
+
+        # first when the masks are finalized save them to the maps
+        self.maps["nucleus_segmentation"] = masks_nucleus.reshape(
+            masks_nucleus.shape[1:]
+        )  # need to add reshape to save in proper format for HDF5
+
+        self.maps["cytosol_segmentation"] = masks_cytosol.reshape(
+            masks_cytosol.shape[1:]
+        )  # need to add reshape to save in proper format for HDF5
+
+        del masks_nucleus, masks_cytosol
+        self._clear_cuda_cache()
+
+    def filter_cell_masks(self, masks_nucleus, masks_cytosol):
+        # log start time of cell filtering to track
+        start = time.time()
         all_nucleus_ids = np.unique(masks_nucleus)[1:]
         nucleus_cytosol_pairs = {}
-
         for nucleus_id in all_nucleus_ids:
             # get the nucleus and set the background to 0 and the nucleus to 1
             nucleus = (masks_nucleus == nucleus_id)
@@ -787,39 +778,31 @@ class CytosolSegmentationCellpose(BaseSegmentation):
                     nucleus_cytosol_pairs[nucleus_id] = cytosol_id
                 else:
                     nucleus_cytosol_pairs[nucleus_id] = 0
-
         # check if there are any cytosol masks that are assigned to multiple nuclei
         cytosol_count = defaultdict(int)
-
         # Count the occurrences of each cytosol value
         for cytosol in nucleus_cytosol_pairs.values():
             cytosol_count[cytosol] += 1
-        
         # Find cytosol values assigned to more than one nucleus
         for nucleus, cytosol in nucleus_cytosol_pairs.items():
             if cytosol_count[cytosol] > 1:
                 nucleus_cytosol_pairs[nucleus] = 0
-
         # get unique cytosol ids that are not in the lookup table
         all_cytosol_ids = set(np.unique(masks_cytosol))
         all_cytosol_ids.discard(0)
         used_cytosol_ids = set(nucleus_cytosol_pairs.values())
         not_used_cytosol_ids = all_cytosol_ids - used_cytosol_ids
-
         # set all cytosol ids that are not present in lookup table to 0 in the cytosol mask
         for cytosol_id in not_used_cytosol_ids:
             masks_cytosol[masks_cytosol == cytosol_id] = 0
-
         # get unique nucleus ids that are not in the lookup table
         all_nucleus_ids = set(np.unique(masks_nucleus))
         all_nucleus_ids.discard(0)
         used_nucleus_ids = set(nucleus_cytosol_pairs.keys())
         not_used_nucleus_ids = all_nucleus_ids - used_nucleus_ids
-
         # set all nucleus ids that are not present in lookup table to 0 in the nucleus mask
         for nucleus_id in not_used_nucleus_ids:
             masks_nucleus[masks_nucleus == nucleus_id] = 0
-
         # now we have all the nucleus cytosol pairs we can filter the masks
         updated_cytosol_mask = np.zeros_like(masks_cytosol, dtype=bool)
         for nucleus_id, cytosol_id in nucleus_cytosol_pairs.items():
@@ -832,27 +815,130 @@ class CytosolSegmentationCellpose(BaseSegmentation):
                 )
                 masks_cytosol[condition] = nucleus_id
                 updated_cytosol_mask = np.logical_or(updated_cytosol_mask, condition)
-        
         end = time.time()
         self.log(f"Time required for filtering generated masks in seconds: {end - start}")
-        
-        if self.debug:
-            # plot nucleus and cytosol masks before and after filtering
-            fig, axs = plt.subplots(2, 2, figsize=(8, 8))
-            axs[0, 0].imshow(masks_nucleus_unfiltered[0])
-            axs[0, 0].axis("off")
-            axs[0, 0].set_title("before filtering", fontsize=6)
-            axs[0, 1].imshow(masks_nucleus[0])
-            axs[0, 1].axis("off")
-            axs[0, 1].set_title("after filtering", fontsize=6)
+        del updated_cytosol_mask, all_nucleus_ids, used_nucleus_ids
+        return masks_nucleus, masks_cytosol
 
-            axs[1, 0].imshow(masks_cytosol_unfiltered[0])
-            axs[1, 0].axis("off")
-            axs[1, 1].imshow(masks_cytosol[0])
-            axs[1, 1].axis("off")
-            fig.tight_layout()
-            fig.show()
-            del fig  # delete figure after showing to free up memory again
+    def load_cytosol_model(self):
+        # load correct segmentation model for cytosol
+        if "model" in self.config["cytosol_segmentation"].keys():
+            model_name = self.config["cytosol_segmentation"]["model"]
+            model = self._read_cellpose_model("pretrained", model_name, self.use_GPU)
+        elif "model_path" in self.config["cytosol_segmentation"].keys():
+            model_name = self.config["cytosol_segmentation"]["model_path"]
+            model = self._read_cellpose_model("custom", model_name, self.use_GPU)
+        if "diameter" in self.config["cytosol_segmentation"].keys():
+            diameter = self.config["cytosol_segmentation"]["diameter"]
+        else:
+            diameter = None
+        self.log(f"Segmenting cytosol using the following model: {model_name}")
+        return diameter, model
+
+    def load_nucleus_model(self):
+        # load correct segmentation model for nuclei
+        if "model" in self.config["nucleus_segmentation"].keys():
+            model_name = self.config["nucleus_segmentation"]["model"]
+            model = self._read_cellpose_model("pretrained", model_name, self.use_GPU)
+        elif "model_path" in self.config["nucleus_segmentation"].keys():
+            model_name = self.config["nucleus_segmentation"]["model_path"]
+            model = self._read_cellpose_model("custom", model_name, self.use_GPU)
+        if "diameter" in self.config["nucleus_segmentation"].keys():
+            diameter = self.config["nucleus_segmentation"]["diameter"]
+        else:
+            diameter = None
+        self.log(f"Segmenting nuclei using the following model: {model_name}")
+        return diameter, model
+
+    def plot_nucleus_cytosol_masks(self, masks_cytosol, masks_cytosol_unfiltered, masks_nucleus,
+                                   masks_nucleus_unfiltered):
+        # plot nucleus and cytosol masks before and after filtering
+        fig, axs = plt.subplots(2, 2, figsize=(8, 8))
+        axs[0, 0].imshow(masks_nucleus_unfiltered[0])
+        axs[0, 0].axis("off")
+        axs[0, 0].set_title("before filtering", fontsize=6)
+        axs[0, 1].imshow(masks_nucleus[0])
+        axs[0, 1].axis("off")
+        axs[0, 1].set_title("after filtering", fontsize=6)
+        axs[1, 0].imshow(masks_cytosol_unfiltered[0])
+        axs[1, 0].axis("off")
+        axs[1, 1].imshow(masks_cytosol[0])
+        axs[1, 1].axis("off")
+        fig.tight_layout()
+        fig.show()
+        del fig  # delete figure after showing to free up memory again
+
+    def _clear_cuda_cache(self):
+        # clean up old cached variables to free up GPU memory
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def process(self, input_image):
+        self._initialize_maps(input_image)
+
+        del input_image
+        gc.collect()
+
+        self.cellpose_segmentation(self.maps["normalized"])
+
+        results = self._post_process()
+        gc.collect()
+
+        return results
+
+    def _post_process(self):
+        # currently no implemented filtering steps to remove nuclei outside of specific thresholds
+        all_classes = np.unique(self.maps["nucleus_segmentation"])
+        channels, segmentation = self._finalize_segmentation_results()
+        results = self.save_segmentation(channels, segmentation, all_classes)
+        # clean up memory
+        del channels, segmentation, all_classes
+        return results
+
+    def _initialize_maps(self, input_image):
+        from alphabase.io import tempmmap
+        TEMP_DIR_NAME = tempmmap.redefine_temp_location(self.config["cache"])
+        # initialize location to save masks to
+        self.maps = {
+            "normalized": tempmmap.array(shape=input_image.shape, dtype=float),
+            "nucleus_segmentation": tempmmap.array(shape=input_image.shape, dtype=np.uint16),
+            "cytosol_segmentation": tempmmap.array(shape=input_image.shape, dtype=np.uint16),
+        }
+        # could add a normalization step here if so desired
+        self.maps["normalized"] = input_image
+
+
+class BatchCytosolSegmentationCellpose(CytosolSegmentationCellpose):
+    def cellpose_segmentation(self, input_image, nucleus_model, nucleus_diameter, cytosol_model, cytosol_diameter):
+        # check that image is int
+        input_image = input_image.astype(np.uint16)
+        # currently no real acceleration through using GPU as we can't load batches
+        self.log(f"GPU Status for segmentation: {self.use_GPU}")
+
+        masks_nucleus = nucleus_model.eval(
+            [input_image], diameter=nucleus_diameter, channels=[1, 0]
+        )[0]
+        masks_nucleus = np.array(masks_nucleus)  # convert to array
+
+        masks_cytosol = cytosol_model.eval(
+            [input_image], diameter=cytosol_diameter, channels=[2, 1]
+        )[0]
+        masks_cytosol = np.array(masks_cytosol)  # convert to array
+
+        if self.debug:
+            # save unfiltered masks for visualization of filtering process
+            masks_nucleus_unfiltered = masks_nucleus.copy()
+            masks_cytosol_unfiltered = masks_cytosol.copy()
+
+        masks_nucleus, masks_cytosol = self.filter_cell_masks(masks_nucleus, masks_cytosol)
+
+        if self.debug:
+            self.plot_nucleus_cytosol_masks(
+                masks_cytosol,
+                masks_cytosol_unfiltered,
+                masks_nucleus,
+                masks_nucleus_unfiltered
+            )
 
         # first when the masks are finalized save them to the maps
         self.maps["nucleus_segmentation"] = masks_nucleus.reshape(
@@ -863,41 +949,27 @@ class CytosolSegmentationCellpose(BaseSegmentation):
             masks_cytosol.shape[1:]
         )  # need to add reshape to save in proper format for HDF5
 
-        del masks_nucleus, masks_cytosol, updated_cytosol_mask, all_nucleus_ids, used_nucleus_ids
-        gc.collect()
-        torch.cuda.empty_cache() 
+        del masks_nucleus, masks_cytosol
 
-    def process(self, input_image):
-        from alphabase.io import tempmmap
-        TEMP_DIR_NAME = tempmmap.redefine_temp_location(self.config["cache"])
+    def process(self, input_image, nucleus_model, nucleus_diameter, cytosol_model, cytosol_diameter):
+        self._initialize_maps(input_image)
 
-        # initialize location to save masks to
-        self.maps = {
-            "normalized": tempmmap.array(shape = input_image.shape, dtype = float),
-            "nucleus_segmentation": tempmmap.array(shape = input_image.shape, dtype = np.uint16),
-            "cytosol_segmentation": tempmmap.array(shape = input_image.shape, dtype = np.uint16),
-        }
-
-        # could add a normalization step here if so desired
-        self.maps["normalized"] = input_image
-        
         del input_image
         gc.collect()
 
-        # self.log("Starting Cellpose DAPI Segmentation.")
-        self.cellpose_segmentation(self.maps["normalized"])
+        self.cellpose_segmentation(
+            self.maps["normalized"],
+            nucleus_model,
+            nucleus_diameter,
+            cytosol_model,
+            cytosol_diameter,
+        )
 
-        # currently no implemented filtering steps to remove nuclei outside of specific thresholds
-        all_classes = np.unique(self.maps["nucleus_segmentation"])
-
-        channels, segmentation = self._finalize_segmentation_results()
-        results = self.save_segmentation(channels, segmentation, all_classes)
-        
-        #clean up memory
-        del channels, segmentation, all_classes
+        results = self._post_process()
         gc.collect()
 
         return results
+
 
 class ShardedCytosolSegmentationCellpose(ShardedSegmentation):
     method = CytosolSegmentationCellpose
@@ -916,16 +988,16 @@ class CytosolSegmentationDownsamplingCellpose(CytosolSegmentationCellpose):
             channels = np.stack(required_maps + feature_maps).astype(np.uint16)
         else:
             channels = np.stack(required_maps).astype(np.uint16)
-        
+
         _seg_size = self.maps["nucleus_segmentation"].shape
         self.log(f"Segmentation size after downsampling before resize to original dimensions: {_seg_size}")
-        
+
         _, x, y = size_padding
         segmentation_size = (x, y) #return to same size as original input image but adjust number of channels expected
 
         nuc_seg = self.maps["nucleus_segmentation"]
         nuc_seg = nuc_seg.repeat(self.config["downsampling_factor"], axis=0).repeat(self.config["downsampling_factor"], axis=1)
-        
+
         cyto_seg = self.maps["cytosol_segmentation"]
         cyto_seg = cyto_seg.repeat(self.config["downsampling_factor"], axis=0).repeat(self.config["downsampling_factor"], axis=1)
 
@@ -939,7 +1011,7 @@ class CytosolSegmentationDownsamplingCellpose(CytosolSegmentationCellpose):
         #combine masks into one stack
         segmentation = np.stack([nuc_seg, cyto_seg]).astype("uint32")
         del cyto_seg, nuc_seg
-        
+
         #rescale segmentation results to original size
         x_trim = x - channels.shape[1]
         y_trim = y - channels.shape[2]
@@ -954,7 +1026,7 @@ class CytosolSegmentationDownsamplingCellpose(CytosolSegmentationCellpose):
         if segmentation.shape[2] !=channels.shape[2]:
             sys.exit("Error. Segmentation mask and image have different shapes")
 
-        return channels, segmentation 
+        return channels, segmentation
 
     def process(self, input_image):
 
@@ -970,13 +1042,13 @@ class CytosolSegmentationDownsamplingCellpose(CytosolSegmentationCellpose):
             pad_x = (0, 0)
         else:
             pad_x = (0, N - x%N)
-        
+
         if y % N == 0:
             pad_y = (0, 0)
         else:
             pad_y = (0, N - y%N)
 
-        downsampled_image_size = (2, _size[1]+pad_x[1], _size[2]+pad_y[1]) 
+        downsampled_image_size = (2, _size[1]+pad_x[1], _size[2]+pad_y[1])
 
         #initialize memory mapped numpy arrays to save results into
         from alphabase.io import tempmmap
@@ -998,11 +1070,11 @@ class CytosolSegmentationDownsamplingCellpose(CytosolSegmentationCellpose):
 
         input_image = input_image[:2, :, :] #only get the first 2 channels for segmentation (does not use excess space on the GPU this way)
         gc.collect()
-        
+
         self.log(f"input image size after removing excess channels: {input_image.shape}")
         input_image = np.pad(input_image, ((0, 0), pad_x, pad_y))
         _size_padding = input_image.shape
-        
+
         self.log(f"Performing image padding to ensure that image is compatible with downsample kernel size. Original image was {_size}, padded image is {_size_padding}")
         input_image = downsample_img(input_image, N= N)
         self.log(f"Downsampled image size {input_image.shape}")
@@ -1089,7 +1161,7 @@ class CytosolOnlySegmentationCellpose(BaseSegmentation):
         #manually delete model and perform gc to free up memory on GPU
         del model
         gc.collect()
-        torch.cuda.empty_cache()  
+        torch.cuda.empty_cache()
 
     def process(self, input_image):
         # initialize location to save masks to
@@ -1133,6 +1205,22 @@ class Multithreaded_WGA_TimecourseSegmentation(MultithreadedSegmentation):
         method = WGASegmentation
 
     method = WGASegmentation_Timecourse
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+
+class Cytosol_Cellpose_BatchSegmentation(CellposeBatchSegmentation):
+    """
+    Specialized Processing for batch segmentation
+    """
+
+    class CytosolSegmentationCellpose_Batch(
+        BatchCytosolSegmentationCellpose, CellposeBatchSegmentation
+    ):
+        method = BatchCytosolSegmentationCellpose
+
+    method = CytosolSegmentationCellpose_Batch
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

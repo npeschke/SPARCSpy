@@ -1,4 +1,6 @@
 import os
+import typing
+
 import numpy as np
 import matplotlib.pyplot as plt
 import csv
@@ -8,6 +10,8 @@ from multiprocessing import Pool
 import shutil
 
 import traceback
+
+import torch.cuda
 from PIL import Image
 from skimage.color import label2rgb
 
@@ -22,6 +26,8 @@ from ome_zarr.writer import write_labels, write_label_metadata
 
 # to show progress
 from tqdm.auto import tqdm
+
+from cellpose import models
 
 #to perform garbage collection
 import gc
@@ -910,7 +916,7 @@ class TimecourseSegmentation(Segmentation):
         shutil.rmtree(self.TEMP_DIR_NAME, ignore_errors=True)
 
         del _tmp_seg, self.TEMP_DIR_NAME
-        gc. collect()
+        gc.collect()
 
     def save_image(self, array, save_name="", cmap="magma", **kwargs):
         if np.issubdtype(array.dtype.type, np.integer):
@@ -1148,3 +1154,136 @@ class MultithreadedSegmentation(TimecourseSegmentation):
 
     def get_output(self):
         return os.path.join(self.directory, self.DEFAULT_OUTPUT_FILE)
+
+
+class CellposeBatchSegmentation(TimecourseSegmentation):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._use_gpu = None
+
+    @property
+    def use_gpu(self):
+        if self._use_gpu is None:
+            self._use_gpu = torch.cuda.is_available()
+        return self._use_gpu
+
+    def _read_cellpose_model(self, model_type, name):
+        if model_type == "pretrained":
+            model = models.Cellpose(model_type=name, gpu=self.use_gpu)
+        elif model_type == "custom":
+            model = models.CellposeModel(pretrained_model=name, gpu=self.use_gpu)
+        return model
+
+    def _load_model(self, model_type: str) -> typing.Tuple[float, models.Cellpose]:
+        """
+        Loads cellpose model
+
+        Parameters
+        ----------
+        model_type
+            either "cytosol" or "nucleus" depending on the model to load
+
+        Returns
+        -------
+        tuple of expected diameter and the cellpose model
+
+        """
+        # load correct segmentation model for cytosol
+        if "model" in self.config[f"{model_type}_segmentation"].keys():
+            model_name = self.config[f"{model_type}_segmentation"]["model"]
+            model = self._read_cellpose_model("pretrained", model_name)
+        elif "model_path" in self.config[f"{model_type}_segmentation"].keys():
+            model_name = self.config[f"{model_type}_segmentation"]["model_path"]
+            model = self._read_cellpose_model("custom", model_name)
+        if "diameter" in self.config[f"{model_type}_segmentation"].keys():
+            diameter = self.config[f"{model_type}_segmentation"]["diameter"]
+        else:
+            diameter = None
+        self.log(f"Segmenting {model_type} using the following model: {model_name}")
+        return diameter, model
+
+
+    def process(self):
+        input_path = os.path.join(self.directory, self.DEFAULT_OUTPUT_FILE)
+
+        with h5py.File(input_path, "r") as hf:
+            input_images = hf.get("input_images")
+            indexes = list(range(0, input_images.shape[0]))
+
+            # initialize segmentation dataset
+            self.shape_input_images = input_images.shape
+            self.shape_segmentation = (
+                input_images.shape[0],
+                self.config["output_masks"],
+                input_images.shape[2],
+                input_images.shape[3],
+            )
+            self.shape_classes = input_images.shape[0]
+
+        # initialize temp object to write segmentations too
+        self._initialize_tempmmap_array()
+
+        #initialzie segmentation objects
+        current_shard = self.method(
+            self.config,
+            self.directory,
+            project_location = self.project_location,
+            debug=self.debug,
+            overwrite=self.overwrite,
+            intermediate_output=self.intermediate_output,
+        )
+
+        current_shard.initialize_as_shard(indexes, input_path=input_path)
+
+        nucleus_diameter, nucleus_model = self._load_model("nucleus")
+        cytosol_diameter, cytosol_model = self._load_model("cytosol")
+
+        self.log("Beginning batch segmentation.")
+        #calculate results for each shard
+        results = [current_shard.call_as_shard(nucleus_model, nucleus_diameter, cytosol_model, cytosol_diameter)]
+
+        # save results to hdf5
+        self.log("Writing segmentation results to .hdf5 file.")
+        self._transfer_tempmmap_to_hdf5()
+
+        #adjust segmentation indexes
+        self.adjust_segmentation_indexes()
+        self.log("Adjusted Indexes.")
+
+    def call_as_shard(self, nucleus_model, nucleus_diameter, cytosol_model, cytosol_diameter):
+        """Wrapper function for calling a sharded segmentation.
+
+        Important:
+
+            This function is intented for internal use by the :class:`ShardedSegmentation` helper class. In most cases it is not relevant to the creation of custom segmentation workflows.
+
+        """
+        global _tmp_seg
+
+        with h5py.File(self.input_path, "r") as hf:
+            hdf_input = hf.get("input_images")
+
+            if type(self.index) == int:
+                self.index = [self.index]
+
+            results = []
+            for index in self.index:
+                self.current_index = index
+                input_image = hdf_input[index, :, :, :]
+
+                self.log(f"Segmentation on index {index} started.")
+                try:
+                    results.append(super().__call__(
+                        input_image,
+                        nucleus_model,
+                        nucleus_diameter,
+                        cytosol_model,
+                        cytosol_diameter
+                    ))
+                except Exception:
+                    self.log(traceback.format_exc())
+                self.log(f"Segmentation on index {index} completed.")
+
+        return results
+
