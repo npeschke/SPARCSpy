@@ -817,6 +817,8 @@ class CytosolSegmentationCellpose(BaseSegmentation):
                 updated_cytosol_mask = np.logical_or(updated_cytosol_mask, condition)
         end = time.time()
         self.log(f"Time required for filtering generated masks in seconds: {end - start}")
+        if min([len(np.unique(masks_nucleus)), len(np.unique(masks_cytosol))]) == 0:
+            self.log(f"No segmented cells/nuclei left after filtering for image index {current_index} of {len(index)}")
         del updated_cytosol_mask, all_nucleus_ids, used_nucleus_ids
         return masks_nucleus, masks_cytosol
 
