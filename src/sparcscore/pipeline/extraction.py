@@ -649,7 +649,7 @@ class TimecourseHDF5CellExtraction(HDF5CellExtraction):
         _tmp_single_cell_index = np.delete(_tmp_single_cell_index, self.save_index_to_remove, axis=0)
 
         #extract information about the annotation of cell ids
-        column_labels = ['index', "cellid"] + list(self.label_names.astype("U13"))[1:]
+        column_labels = ['index', "cellid"] + list(self.label_names.astype("U100"))[1:]
         
         self.log("Creating HDF5 file to save results to.")
         with h5py.File(self.output_path, 'w') as hf:
