@@ -1,5 +1,7 @@
 #generated project folders in example datasets
 project/
+example_data/debug_extraction/
+example_data/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

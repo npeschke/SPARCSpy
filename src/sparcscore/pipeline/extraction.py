@@ -621,7 +621,7 @@ class TimecourseHDF5CellExtraction(HDF5CellExtraction):
         TEMP_DIR_NAME = tempmmap.redefine_temp_location(self.config["cache"])
 
         #generate datacontainer for the single cell images
-        column_labels = ['index', "cellid"] + list(self.label_names.astype("U13"))[1:]
+        column_labels = ['index', "cellid"] + list(self.label_names.astype("U100"))[1:]
         self.single_cell_index_shape =  (self.num_classes, len(column_labels))
         self.single_cell_data_shape = (self.num_classes,
                                                     self.n_channels_output,
@@ -635,7 +635,7 @@ class TimecourseHDF5CellExtraction(HDF5CellExtraction):
         #generate container for single_cell_index
         #cannot be a temmmap array with object type as this doesnt work for memory mapped arrays
         #dt = h5py.special_dtype(vlen=str)
-        _tmp_single_cell_index  = np.empty(self.single_cell_index_shape, dtype = "<U64") #need to use U64 here otherwise information potentially becomes truncated
+        _tmp_single_cell_index  = np.empty(self.single_cell_index_shape, dtype = "<U512") #need to use U64 here otherwise information potentially becomes truncated
         
         #_tmp_single_cell_index  = tempmmap.array(self.single_cell_index_shape, dtype = "<U32")
 
